@@ -28,13 +28,19 @@ def load_models(df):
 
     for col in embedding_cols:
         df[col] = df[col].apply(lambda x: np.array(x) if isinstance(x, list) else x)
+        
 
+    
     scaler = MinMaxScaler()
     columns_to_normalize = ['average_rating','sentiment_score','weighted_rating', 'rating_number', 'emotion_score']
     df[columns_to_normalize] = scaler.fit_transform(df[columns_to_normalize])
     return (*build_models(df), scaler)
+@st.cache_data
+def load_data():
+    return joblib.load("df.pkl")
 
-df = joblib.load("df.pkl")
+df = load_data()
+
 best_cb_model, best_cf_model, best_mm_model, scaler = load_models(df)
 
 # ---------- Utility ----------
@@ -253,9 +259,6 @@ def show_home():
                         st.query_params["from_search"] = "false"
                         st.rerun()
 
-    st.subheader("📄 Top 5 Rows of the Full Data")
-    st.dataframe(df.head())
-
 
 # ---------- Product Detail Page ----------
 def apply_recommendation_fallbacks(df, base_df):
@@ -287,48 +290,42 @@ def apply_recommendation_fallbacks(df, base_df):
 def show_product_detail(asin):
     product = df[df['parent_asin'] == asin].iloc[0]
     title = product.get("product_title", asin)
-    st.subheader(f"🧾 Product Detail — {title}")
+    st.subheader(f"💾 Product Detail — {title}")
     st.image(load_and_pad_image(product["large_image_link"]), width=300)
 
     average_rating = product.get('average_rating', None)
     rating_number = product.get('rating_number', None)
-
-    if average_rating is not None and rating_number is not None:
-        columns_to_normalize = ['average_rating', 'sentiment_score', 'weighted_rating', 'rating_number', 'emotion_score']
-
-        # Use actual values from the product row (already normalized)
-        temp_row = product[columns_to_normalize].values.reshape(1, -1)
-        unnormalized = scaler.inverse_transform(temp_row)[0]
-
-        st.markdown(f"**Average Rating:** {round(unnormalized[0], 2)}")
-        st.markdown(f"**Rating Count:** {int(unnormalized[3])}")
-    else:
-        st.markdown("**Average Rating:** N/A")
-        st.markdown("**Rating Count:** N/A")
+    st.markdown(f"**Average Rating:** {average_rating}")
+    st.markdown(f"**Rating Count:** {rating_number}")
 
     for label, key in [
         ("📝 Features", "product_features"),
         ("🛍️ Description", "product_description"),
-        ("🏬 Store", "product_store"),
+        ("🏪 Store", "product_store"),
         ("📦 Details", "product_details")
     ]:
         with st.expander(label):
             value = product.get(key, None)
+            if key in ["product_features", "product_description"] and isinstance(value, str):
+                value = [item.strip() for item in value.split(".") if item.strip()]
+            if key == "product_details" and isinstance(value, str):
+                try:
+                    value = json.loads(value)
+                except Exception:
+                    value = {}
 
             if isinstance(value, list) and value:
                 for item in value:
                     st.markdown(f"- {item}")
-
             elif isinstance(value, dict) and value:
                 for k, v in value.items():
                     st.markdown(f"- **{k}**: {v}")
-
             elif isinstance(value, str) and value.strip():
                 st.markdown(f"- {value}")
-
             else:
                 st.markdown("_No information available._")
 
+    user_dataset = st.session_state.user_dataset
     already_bought = (
         not user_dataset.empty and
         asin in user_dataset['parent_asin'].values
@@ -338,7 +335,6 @@ def show_product_detail(asin):
     if st.button(buy_label):
         st.session_state["buy_clicked"] = True
 
-    # Show review form after clicking buy
     if st.session_state.get("buy_clicked"):
         with st.form("review_form", clear_on_submit=True):
             rating = st.slider("Rate this product:", 1, 5, 5)
@@ -350,11 +346,13 @@ def show_product_detail(asin):
                 review_text = f"{title} {body}".strip()
                 enriched = enrich_review_features(review_text, rating)
 
-                new_row = product.copy()
+                new_row = product.to_dict()
                 new_row["rating"] = rating
                 new_row["weighted_rating"] = rating
+                new_row["title"] = title
+                new_row["text"] = body
+                new_row["review"] = f"{title} - {body}"
 
-                # User ID logic
                 if selected_user != "New User":
                     new_row["user_id"] = selected_user
                     user_row = df[df["user_id"] == selected_user].iloc[0]
@@ -363,10 +361,8 @@ def show_product_detail(asin):
                     new_row["user_id"] = "0"
                     new_row["user_id_encoded"] = 0
 
-                # Add enriched features
                 new_row.update(enriched)
 
-                # Append and fallback-clean
                 st.session_state.user_dataset = pd.concat(
                     [st.session_state.user_dataset, pd.DataFrame([new_row])],
                     ignore_index=True
@@ -394,27 +390,35 @@ def show_product_detail(asin):
             st.rerun()
 
     with st.expander("💬 Past Reviews"):
-        reviews = df[df['parent_asin'] == asin][['user_id', 'rating', 'title','text']]
+        combined_reviews = pd.concat([
+            df[['parent_asin', 'user_id', 'rating', 'title', 'text']],
+            user_dataset[['parent_asin', 'user_id', 'rating', 'title', 'text']]
+        ], ignore_index=True)
+
+        reviews = combined_reviews[combined_reviews['parent_asin'] == asin]
         if not reviews.empty:
             for _, row in reviews.iterrows():
                 with st.container(border=True):
                     st.markdown(f"**👤 {row['user_id']}** — ⭐ {row['rating']}")
-                    st.markdown(f"**{row['title']}**")
+                    if row.get('title'):
+                        st.markdown(f"**{row['title']}**")
                     st.markdown(row['text'])
         else:
             st.info("No reviews yet.")
-            
+
     st.subheader("🔁 You May Also Like")
 
-    # Use real dataset if already bought, else simulate it
-    base_input = user_dataset.copy()
-    if asin not in base_input['parent_asin'].values:
-        simulated_row = product.copy()
-        base_input = pd.concat([base_input, pd.DataFrame([simulated_row])], ignore_index=True)
+    if asin in st.session_state.user_dataset['parent_asin'].values:
+        input_row = st.session_state.user_dataset[st.session_state.user_dataset['parent_asin'] == asin].iloc[[-1]]
+    else:
+        product["review_features"] = None
+        product["review_keyword_features"] = None
+        product["sentiment_score"] = np.nan
+        product["emotion_score"] = np.nan
+        product["weighted_rating"] = np.nan 
+        input_row = pd.DataFrame([product])
+    input_for_recs = apply_recommendation_fallbacks(input_row, df)
 
-    # Apply fallbacks
-    input_for_recs = apply_recommendation_fallbacks(base_input, df)
-    
     with st.spinner("Generating recommendations..."):
         if not input_for_recs.empty:
             top_recs = get_hybrid_recommendations(
@@ -430,7 +434,6 @@ def show_product_detail(asin):
             )
 
             rec_items_df = df[df['parent_asin'].isin([asin for asin, _ in top_recs])].drop_duplicates('parent_asin')
-
             rows = [rec_items_df.iloc[i:i + 5] for i in range(0, len(rec_items_df), 5)]
             for row_items in rows:
                 cols = st.columns(len(row_items))
@@ -447,6 +450,7 @@ def show_product_detail(asin):
                                 st.query_params["asin"] = item["parent_asin"]
                                 st.query_params["from_search"] = "false"
                                 st.rerun()
+
 # ---------- Search Results Page ----------
 def show_search_results(q):
     st.subheader(f"🔍 10 Search Results for: `{q}`")
